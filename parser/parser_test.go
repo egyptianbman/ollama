@@ -29,6 +29,8 @@ ADAPTER adapter1
 LICENSE MIT
 PARAMETER param1 value1
 PARAMETER param2 value2
+INFO info1 value1
+INFO info2 value2
 TEMPLATE """{{ if .System }}<|start_header_id|>system<|end_header_id|>
 
 {{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>
@@ -47,8 +49,10 @@ TEMPLATE """{{ if .System }}<|start_header_id|>system<|end_header_id|>
 		{Name: "model", Args: "model1"},
 		{Name: "adapter", Args: "adapter1"},
 		{Name: "license", Args: "MIT"},
-		{Name: "param1", Args: "value1"},
-		{Name: "param2", Args: "value2"},
+		{Name: "parameter", Args: &Parameter{"param1", "value1"}},
+		{Name: "parameter", Args: &Parameter{"param2", "value2"}},
+		{Name: "info", Args: &Parameter{"info1", "value1"}},
+		{Name: "info", Args: &Parameter{"info2", "value2"}},
 		{Name: "template", Args: "{{ if .System }}<|start_header_id|>system<|end_header_id|>\n\n{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>\n\n{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>\n\n{{ .Response }}<|eot_id|>"},
 	}
 
@@ -62,6 +66,8 @@ ADAPTER      adapter3
 LICENSE "MIT       "
 PARAMETER param1        value1
 PARAMETER param2    value2
+INFO info1           value1
+INFO info2     value2
 TEMPLATE """   {{ if .System }}<|start_header_id|>system<|end_header_id|>
 
 {{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>
@@ -80,8 +86,10 @@ TEMPLATE """   {{ if .System }}<|start_header_id|>system<|end_header_id|>
 		{Name: "model", Args: "     model 1"},
 		{Name: "adapter", Args: "adapter3"},
 		{Name: "license", Args: "MIT       "},
-		{Name: "param1", Args: "value1"},
-		{Name: "param2", Args: "value2"},
+		{Name: "parameter", Args: &Parameter{Name: "param1", Value: "value1"}},
+		{Name: "parameter", Args: &Parameter{Name: "param2", Value: "value2"}},
+		{Name: "info", Args: &Parameter{Name: "info1", Value: "value1"}},
+		{Name: "info", Args: &Parameter{Name: "info2", Value: "value2"}},
 		{Name: "template", Args: "   {{ if .System }}<|start_header_id|>system<|end_header_id|>\n\n{{ .System }}<|eot_id|>{{ end }}{{ if .Prompt }}<|start_header_id|>user<|end_header_id|>\n\n{{ .Prompt }}<|eot_id|>{{ end }}<|start_header_id|>assistant<|end_header_id|>\n\n{{ .Response }}<|eot_id|>   "},
 	}
 
@@ -101,7 +109,7 @@ func TestParseFileFrom(t *testing.T) {
 		},
 		{
 			"FROM \"FOO BAR\"\nPARAMETER param1 value1",
-			[]Command{{Name: "model", Args: "FOO BAR"}, {Name: "param1", Args: "value1"}},
+			[]Command{{Name: "model", Args: "FOO BAR"}, {Name: "parameter", Args: &Parameter{Name: "param1", Value: "value1"}}},
 			nil,
 		},
 		{
@@ -149,12 +157,22 @@ func TestParseFileFrom(t *testing.T) {
 		},
 		{
 			"PARAMETER param1 value1\nFROM foo",
-			[]Command{{Name: "param1", Args: "value1"}, {Name: "model", Args: "foo"}},
+			[]Command{{Name: "parameter", Args: &Parameter{Name: "param1", Value: "value1"}}, {Name: "model", Args: "foo"}},
 			nil,
 		},
 		{
 			"PARAMETER what the \nFROM lemons make lemonade ",
-			[]Command{{Name: "what", Args: "the"}, {Name: "model", Args: "lemons make lemonade"}},
+			[]Command{{Name: "parameter", Args: &Parameter{Name: "what", Value: "the"}}, {Name: "model", Args: "lemons make lemonade"}},
+			nil,
+		},
+		{
+			"FROM gpt-oss:120b --remote_url ollama.com\n",
+			[]Command{{Name: "model", Args: "gpt-oss:120b"}, {Name: "remote", Args: "ollama.com"}},
+			nil,
+		},
+		{
+			"FROM test\nPARAMETER param1 value1\nINFO info1 value1",
+			[]Command{{Name: "model", Args: "test"}, {Name: "parameter", Args: &Parameter{Name: "param1", Value: "value1"}}, {Name: "info", Args: &Parameter{Name: "info1", Value: "value1"}}},
 			nil,
 		},
 	}
@@ -174,6 +192,19 @@ func TestParseFileParametersMissingValue(t *testing.T) {
 	input := `
 FROM foo
 PARAMETER param1
+`
+
+	reader := strings.NewReader(input)
+
+	_, err := ParseFile(reader)
+	require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+}
+
+func TestParseFileInfoMissingValue(t *testing.T) {
+	input := `
+FROM foo
+INFO info1
+PARAMETER param1 foo
 `
 
 	reader := strings.NewReader(input)
@@ -514,7 +545,7 @@ func TestParseFileParameters(t *testing.T) {
 
 			assert.Equal(t, []Command{
 				{Name: "model", Args: "foo"},
-				{Name: v.name, Args: v.value},
+				{Name: "parameter", Args: &Parameter{Name: v.name, Value: v.value}},
 			}, modelfile.Commands)
 		})
 	}
@@ -553,6 +584,8 @@ ADAPTER adapter1
 LICENSE MIT
 PARAMETER param1 value1
 PARAMETER param2 value2
+INFO info1 value1
+INFO info2 value2
 TEMPLATE template1
 MESSAGE system You are a file parser. Always parse things.
 MESSAGE user Hey there!
@@ -617,8 +650,8 @@ SYSTEM You are a utf16 file.
 
 	expected := []Command{
 		{Name: "model", Args: "bob"},
-		{Name: "param1", Args: "1"},
-		{Name: "param2", Args: "4096"},
+		{Name: "parameter", Args: &Parameter{Name: "param1", Value: "1"}},
+		{Name: "parameter", Args: &Parameter{Name: "param2", Value: "4096"}},
 		{Name: "system", Args: "You are a utf16 file."},
 	}
 
@@ -724,6 +757,30 @@ MESSAGE assistant Hi! How are you?
 					{Role: "user", Content: "Hello there!"},
 					{Role: "assistant", Content: "Hi! How are you?"},
 				},
+			},
+		},
+		{
+			`FROM test-model:turbo --remote_url myhost.com
+PARAMETER temperature 0.5
+SYSTEM You are a turbo bot.
+LICENSE license1
+`,
+			&api.CreateRequest{
+				From:       "test-model:turbo",
+				RemoteURL:  "myhost.com",
+				Parameters: map[string]any{"temperature": float32(0.5)},
+				License:    []string{"license1"},
+				System:     "You are a turbo bot.",
+			},
+		},
+		{
+			`FROM foo
+INFO model_family gptoss
+INFO quantization_level MXFP4
+`,
+			&api.CreateRequest{
+				From: "foo",
+				Info: map[string]any{"model_family": "gptoss", "quantization_level": "MXFP4"},
 			},
 		},
 	}

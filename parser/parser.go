@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"runtime"
 	"slices"
 	"strconv"
@@ -51,6 +53,85 @@ var deprecatedParameters = []string{
 	"mirostat_eta",
 }
 
+type info struct {
+	Capabilities []string `json:"capabilities,omitempty"`
+	ModelFamily  string   `json:"model_family,omitempty"`
+	BaseName     string   `json:"base_name,omitempty"`
+	FileType     string   `json:"quantization_level,omitempty"`
+	ModelType    string   `json:"parameter_size,omitempty"`
+	ContextLen   int      `json:"context_length,omitempty"`
+	EmbedLen     int      `json:"embedding_length,omitempty"`
+}
+
+func formatInfo(data map[string][]string) (map[string]any, error) {
+	opts := info{}
+	valueOpts := reflect.ValueOf(&opts).Elem() // names of the fields in the options struct
+	typeOpts := reflect.TypeOf(opts)           // types of the fields in the options struct
+
+	// build map of json struct tags to their types
+	jsonOpts := make(map[string]reflect.StructField)
+	for _, field := range reflect.VisibleFields(typeOpts) {
+		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonTag != "" {
+			jsonOpts[jsonTag] = field
+		}
+	}
+
+	out := make(map[string]any)
+	// iterate params and set values based on json struct tags
+	for key, vals := range data {
+		if opt, ok := jsonOpts[key]; !ok {
+			return nil, fmt.Errorf("unknown info parameter '%s'", key)
+		} else {
+			field := valueOpts.FieldByName(opt.Name)
+			if field.IsValid() && field.CanSet() {
+				switch field.Kind() {
+				case reflect.Float32:
+					floatVal, err := strconv.ParseFloat(vals[0], 32)
+					if err != nil {
+						return nil, fmt.Errorf("invalid float value %s", vals)
+					}
+
+					out[key] = float32(floatVal)
+				case reflect.Int:
+					intVal, err := strconv.ParseInt(vals[0], 10, 64)
+					if err != nil {
+						return nil, fmt.Errorf("invalid int value %s", vals)
+					}
+
+					out[key] = intVal
+				case reflect.Bool:
+					boolVal, err := strconv.ParseBool(vals[0])
+					if err != nil {
+						return nil, fmt.Errorf("invalid bool value %s", vals)
+					}
+
+					out[key] = boolVal
+				case reflect.String:
+					out[key] = vals[0]
+				case reflect.Slice:
+					// TODO: only string slices are supported right now
+					out[key] = vals
+				case reflect.Pointer:
+					var b bool
+					if field.Type() == reflect.TypeOf(&b) {
+						boolVal, err := strconv.ParseBool(vals[0])
+						if err != nil {
+							return nil, fmt.Errorf("invalid bool value %s", vals)
+						}
+						out[key] = &boolVal
+					} else {
+						return nil, fmt.Errorf("unknown type %s for %s", field.Kind(), key)
+					}
+				default:
+					return nil, fmt.Errorf("unknown type %s for %s", field.Kind(), key)
+				}
+			}
+		}
+	}
+	return out, nil
+}
+
 // CreateRequest creates a new *api.CreateRequest from an existing Modelfile
 func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error) {
 	req := &api.CreateRequest{}
@@ -58,18 +139,20 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 	var messages []api.Message
 	var licenses []string
 	params := make(map[string]any)
+	info := make(map[string]any)
 
 	for _, c := range f.Commands {
 		switch c.Name {
 		case "model":
-			path, err := expandPath(c.Args, relativeDir)
+			n := c.Args.(string)
+			path, err := expandPath(n, relativeDir)
 			if err != nil {
 				return nil, err
 			}
 
 			digestMap, err := fileDigestMap(path)
 			if errors.Is(err, os.ErrNotExist) {
-				req.From = c.Args
+				req.From = n
 				continue
 			} else if err != nil {
 				return nil, err
@@ -82,8 +165,12 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 					req.Files[k] = v
 				}
 			}
+		case "remote":
+			n := c.Args.(string)
+			req.RemoteURL = n
 		case "adapter":
-			path, err := expandPath(c.Args, relativeDir)
+			n := c.Args.(string)
+			path, err := expandPath(n, relativeDir)
 			if err != nil {
 				return nil, err
 			}
@@ -95,21 +182,26 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 
 			req.Adapters = digestMap
 		case "template":
-			req.Template = c.Args
+			n := c.Args.(string)
+			req.Template = n
 		case "system":
-			req.System = c.Args
+			n := c.Args.(string)
+			req.System = n
 		case "license":
-			licenses = append(licenses, c.Args)
+			n := c.Args.(string)
+			licenses = append(licenses, n)
 		case "message":
-			role, msg, _ := strings.Cut(c.Args, ": ")
+			n := c.Args.(string)
+			role, msg, _ := strings.Cut(n, ": ")
 			messages = append(messages, api.Message{Role: role, Content: msg})
-		default:
+		case "parameter":
 			if slices.Contains(deprecatedParameters, c.Name) {
-				fmt.Printf("warning: parameter %s is deprecated\n", c.Name)
+				fmt.Printf("warning: parameter '%s' is deprecated\n", c.Name)
 				break
 			}
+			n := c.Args.(*Parameter)
 
-			ps, err := api.FormatParams(map[string][]string{c.Name: {c.Args}})
+			ps, err := api.FormatParams(map[string][]string{n.Name: {n.Value}})
 			if err != nil {
 				return nil, err
 			}
@@ -123,11 +215,32 @@ func (f Modelfile) CreateRequest(relativeDir string) (*api.CreateRequest, error)
 					params[k] = v
 				}
 			}
+		case "info":
+			n := c.Args.(*Parameter)
+			ps, err := formatInfo(map[string][]string{n.Name: {n.Value}})
+			if err != nil {
+				return nil, err
+			}
+
+			for k, v := range ps {
+				if ks, ok := info[k].([]string); ok {
+					info[k] = append(ks, v.([]string)...)
+				} else if vs, ok := v.([]string); ok {
+					info[k] = vs
+				} else {
+					info[k] = v
+				}
+			}
+		default:
+			return nil, fmt.Errorf("warning: unknown command '%s'", c.Name)
 		}
 	}
 
 	if len(params) > 0 {
 		req.Parameters = params
+	}
+	if len(info) > 0 {
+		req.Info = info
 	}
 	if len(messages) > 0 {
 		req.Messages = messages
@@ -312,7 +425,12 @@ func filesForModel(path string) ([]string, error) {
 
 type Command struct {
 	Name string
-	Args string
+	Args any
+}
+
+type Parameter struct {
+	Name  string
+	Value string
 }
 
 func (c Command) String() string {
@@ -321,12 +439,20 @@ func (c Command) String() string {
 	case "model":
 		fmt.Fprintf(&sb, "FROM %s", c.Args)
 	case "license", "template", "system", "adapter":
-		fmt.Fprintf(&sb, "%s %s", strings.ToUpper(c.Name), quote(c.Args))
+		n := c.Args.(string)
+		fmt.Fprintf(&sb, "%s %s", strings.ToUpper(c.Name), quote(n))
 	case "message":
-		role, message, _ := strings.Cut(c.Args, ": ")
+		n := c.Args.(string)
+		role, message, _ := strings.Cut(n, ": ")
 		fmt.Fprintf(&sb, "MESSAGE %s %s", role, quote(message))
+	case "parameter":
+		n := c.Args.(*Parameter)
+		fmt.Fprintf(&sb, "PARAMETER %s %s", n.Name, n.Value)
+	case "info":
+		n := c.Args.(*Parameter)
+		fmt.Fprintf(&sb, "INFO %s %s", n.Name, n.Value)
 	default:
-		fmt.Fprintf(&sb, "PARAMETER %s %s", c.Name, quote(c.Args))
+		fmt.Printf("unknown command '%s'\n", c.Name)
 	}
 
 	return sb.String()
@@ -347,6 +473,7 @@ var (
 	errMissingFrom        = errors.New("no FROM line")
 	errInvalidMessageRole = errors.New("message role must be one of \"system\", \"user\", or \"assistant\"")
 	errInvalidCommand     = errors.New("command must be one of \"from\", \"license\", \"template\", \"system\", \"adapter\", \"parameter\", or \"message\"")
+	errInvalidFromFlag    = errors.New("invalid flag. only --remote_url is supported")
 )
 
 type ParserError struct {
@@ -410,9 +537,9 @@ func ParseFile(r io.Reader) (*Modelfile, error) {
 				switch s := strings.ToLower(b.String()); s {
 				case "from":
 					cmd.Name = "model"
-				case "parameter":
-					// transition to stateParameter which sets command name
+				case "parameter", "info":
 					next = stateParameter
+					cmd.Name = s
 				case "message":
 					// transition to stateMessage which validates the message role
 					next = stateMessage
@@ -420,8 +547,6 @@ func ParseFile(r io.Reader) (*Modelfile, error) {
 				default:
 					cmd.Name = s
 				}
-			case stateParameter:
-				cmd.Name = b.String()
 			case stateMessage:
 				if !isValidMessageRole(b.String()) {
 					return nil, &ParserError{
@@ -433,6 +558,18 @@ func ParseFile(r io.Reader) (*Modelfile, error) {
 				role = b.String()
 			case stateComment, stateNil:
 				// pass
+			case stateParameter:
+				s, ok := unquote(strings.TrimSpace(b.String()))
+				if !ok || isSpace(r) {
+					if _, err := b.WriteRune(r); err != nil {
+						return nil, err
+					}
+
+					continue
+				}
+				cmd.Args = &Parameter{
+					Name: s,
+				}
 			case stateValue:
 				s, ok := unquote(strings.TrimSpace(b.String()))
 				if !ok || isSpace(r) {
@@ -447,9 +584,27 @@ func ParseFile(r io.Reader) (*Modelfile, error) {
 					s = role + ": " + s
 					role = ""
 				}
+				if cmd.Name == "model" {
+					parts := regexp.MustCompile(`\s+--remote_url\s+`).Split(s, -1)
 
-				cmd.Args = s
-				f.Commands = append(f.Commands, cmd)
+					if len(parts) == 1 {
+						cmd.Args = parts[0]
+						f.Commands = append(f.Commands, cmd)
+					} else if len(parts) == 2 {
+						cmd.Args = parts[0]
+						f.Commands = append(f.Commands, cmd, Command{Name: "remote", Args: parts[1]})
+					} else {
+						// error here
+						fmt.Printf("parts = %#v\n", parts)
+					}
+				} else if cmd.Name == "parameter" || cmd.Name == "info" {
+					c := cmd.Args.(*Parameter)
+					c.Value = s
+					f.Commands = append(f.Commands, cmd)
+				} else {
+					cmd.Args = s
+					f.Commands = append(f.Commands, cmd)
+				}
 			}
 
 			b.Reset()
@@ -477,7 +632,12 @@ func ParseFile(r io.Reader) (*Modelfile, error) {
 			s = role + ": " + s
 		}
 
-		cmd.Args = s
+		if cmd.Name == "parameter" || cmd.Name == "info" {
+			c := cmd.Args.(*Parameter)
+			c.Value = s
+		} else {
+			cmd.Args = s
+		}
 		f.Commands = append(f.Commands, cmd)
 	default:
 		return nil, io.ErrUnexpectedEOF
@@ -606,7 +766,7 @@ func isValidMessageRole(role string) bool {
 
 func isValidCommand(cmd string) bool {
 	switch strings.ToLower(cmd) {
-	case "from", "license", "template", "system", "adapter", "parameter", "message":
+	case "from", "license", "template", "system", "adapter", "parameter", "info", "message":
 		return true
 	default:
 		return false
